@@ -8,5 +8,3 @@
 4. Install deps: pip install -r requirements.txt
 5. Edit producer.py: Add your Power BI Push URL
 6. Run: python producer.py
-
-Dashboard: Create streaming push dataset in Power BI Service, use the schema from our earlier guide.
