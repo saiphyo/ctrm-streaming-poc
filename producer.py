@@ -1,32 +1,35 @@
 import json
 import time
 import random
-from kafka import KafkaProducer, KafkaConsumer
-import requests
+import os
+from dotenv import load_dotenv
+load_dotenv()
+from confluent_kafka import Producer
 
-# === CONFIG ===
-BOOTSTRAP_SERVERS = 'localhost:9092'
-TOPIC = 'ctrm-topic'
-PUSH_URL = 'YOUR_PUSH_URL_HERE'  # From Power BI
-HEADERS = {'Content-Type': 'application/json'}
+# === FABRIC KAFKA ENDPOINT (from Custom App source) ===
+BOOTSTRAP_SERVERS = os.getenv("FABRIC_BOOTSTRAP")      # e.g. ctrm-rti-poc-eh.servicebus.windows.net:9093
+CONNECTION_STRING = os.getenv("FABRIC_CONN_STR")
+TOPIC = 'es_e4bdbac5-7a11-43ee-ba83-ccef8856cf54'
 
-# === KAFKA SETUP ===
-producer = KafkaProducer(
-    bootstrap_servers=BOOTSTRAP_SERVERS,
-    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-    linger_ms=10,  # Batch for efficiency
-    batch_size=16384
-)
 
-consumer = KafkaConsumer(
-    TOPIC,
-    bootstrap_servers=BOOTSTRAP_SERVERS,
-    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-    auto_offset_reset='latest',
-    enable_auto_commit=True,
-    group_id='ctrm-producer-group',
-    consumer_timeout_ms=1000  # Prevent infinite block
-)
+# SASL config
+conf = {
+    'bootstrap.servers': BOOTSTRAP_SERVERS,
+    'security.protocol': 'SASL_SSL',
+    'sasl.mechanism': 'PLAIN',
+    'sasl.username': '$ConnectionString',
+    'sasl.password': CONNECTION_STRING,
+    'client.id': 'ctrm-producer'
+}
+
+producer = Producer(conf)
+
+# Delivery callback (optional, for confirmation)
+def delivery_report(err, msg):
+    if err:
+        print(f"Message failed: {err}")
+    else:
+        print(f"Sent to {msg.topic()} [{msg.partition()}] @ {msg.offset()}")
 
 # === STATE ===
 commodities = ['Oil', 'Gold', 'Wheat']
@@ -35,106 +38,131 @@ trade_counter = 0
 open_trades = {}
 
 def calculate_pnl(trade, current_price, is_close=False):
-    if trade['position_type'] == 'Long':
-        diff = (current_price - trade['entry_price']) if not is_close else (trade['close_price'] - trade['entry_price'])
+    """Calculate PnL for a trade.
+
+    This helper accepts trade dicts with different key naming conventions (e.g.,
+    lowercase keys used when creating ephemeral dicts and CamelCase keys used in
+    produced payloads). It will try common variants for each required field.
+    """
+    def _get(*names):
+        for n in names:
+            if n in trade:
+                return trade[n]
+        return None
+
+    position = _get('position_type', 'PositionType', 'positionType')
+    entry_price = _get('entry_price', 'EntryPrice', 'entryPrice')
+    close_price = _get('close_price', 'ClosePrice', 'closePrice')
+    quantity = _get('quantity', 'Quantity', 'qty', 'Qty')
+
+    # Fallbacks / basic validation
+    if position is None or entry_price is None or quantity is None:
+        raise KeyError(f"Missing required trade fields for PnL calculation: position={position}, entry={entry_price}, qty={quantity}")
+
+    # Use current_price for unrealized PnL, and close_price when closing
+    if is_close:
+        if close_price is None:
+            # If close price not present, assume provided current_price is the close
+            close_price = current_price
+
+    if position == 'Long':
+        if not is_close:
+            diff = (current_price - entry_price)
+        else:
+            diff = (close_price - entry_price)
     else:
-        diff = (trade['entry_price'] - current_price) if not is_close else (trade['entry_price'] - trade['close_price'])
-    return round(diff * trade['quantity'], 2)
+        if not is_close:
+            diff = (entry_price - current_price)
+        else:
+            diff = (entry_price - close_price)
 
-# === INITIAL PRICES ===
-for comm in commodities:
-    price_data = {
-        'type': 'price',
-        'commodity': comm,
-        'price': current_prices[comm],
-        'volume': round(random.uniform(1000, 5000), 2)
-    }
-    producer.send(TOPIC, price_data)
+    return round(diff * quantity, 2)
 
-print("CTRM Producer started. Streaming to Power BI...")
+print("CTRM Producer → Fabric Eventstream (confluent-kafka)")
 
-# === MAIN LOOP ===
 try:
+    # Initial prices
+    for comm in commodities:
+        payload = {
+            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'commodity': comm,
+            'CurrentPrice': current_prices[comm],
+            'Volume': round(random.uniform(1000, 5000), 2),
+            'TradeID': 0,
+            'Quantity': 0,
+            'EntryPrice': 0,
+            'Status': '',
+            'PositionType': '',
+            'ClosePrice': 0,
+            'UnrealizedPnL': 0.0,
+            'RealizedPnL': 0.0
+        }
+        producer.produce(TOPIC, json.dumps(payload).encode('utf-8'), callback=delivery_report)
+
     while True:
-        # === PRODUCE DATA ===
+        # Flush any pending messages
+        producer.poll(0)
+
+        # Produce prices
         for comm in commodities:
             current_prices[comm] += random.uniform(-5, 5)
-            price_data = {
-                'type': 'price',
-                'commodity': comm,
+            payload = {
                 'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'price': round(current_prices[comm], 2),
-                'volume': round(random.uniform(1000, 5000), 2)
+                'commodity': comm,
+                'CurrentPrice': round(current_prices[comm], 2),
+                'Volume': round(random.uniform(1000, 5000), 2),
+                'TradeID': 0,
+                'Quantity': 0,
+                'EntryPrice': 0,
+                'Status': '',
+                'PositionType': '',
+                'ClosePrice': 0,
+                'UnrealizedPnL': 0.0,
+                'RealizedPnL': 0.0
             }
-            producer.send(TOPIC, price_data)
+            producer.produce(TOPIC, json.dumps(payload).encode('utf-8'), callback=delivery_report)
 
-        # New trade?
+        # New trade
         if random.random() > 0.7:
             trade_counter += 1
             comm = random.choice(commodities)
-            trade = {
-                'type': 'trade',
-                'trade_id': trade_counter,
-                'commodity': comm,
-                'quantity': round(random.uniform(100, 1000), 2),
-                'entry_price': round(current_prices[comm] + random.uniform(-10, 10), 2),
-                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'status': 'Open',
-                'position_type': random.choice(['Long', 'Short'])
-            }
-            producer.send(TOPIC, trade)
-            open_trades[trade_counter] = trade
+            quantity = round(random.uniform(100, 1000), 2)
+            entry_price = round(current_prices[comm] + random.uniform(-10, 10), 2)
+            position_type = random.choice(['Long', 'Short'])
+            unrealized_pnl = calculate_pnl({'position_type': position_type, 'entry_price': entry_price, 'quantity': quantity}, current_prices[comm])
 
-        # Close trade?
+            payload = {
+                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'commodity': comm,
+                'CurrentPrice': current_prices[comm],
+                'Volume': 0,
+                'TradeID': trade_counter,
+                'Quantity': quantity,
+                'EntryPrice': entry_price,
+                'Status': 'Open',
+                'PositionType': position_type,
+                'ClosePrice': 0,
+                'UnrealizedPnL': unrealized_pnl,
+                'RealizedPnL': 0.0
+            }
+            producer.produce(TOPIC, json.dumps(payload).encode('utf-8'), callback=delivery_report)
+            open_trades[trade_counter] = payload
+
+        # Close trade
         if open_trades and random.random() > 0.8:
             close_id = random.choice(list(open_trades.keys()))
             trade = open_trades.pop(close_id)
-            trade['status'] = 'Closed'
-            trade['close_price'] = round(current_prices[trade['commodity']], 2)
-            trade['close_timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
-            producer.send(TOPIC, trade)
+            trade['Status'] = 'Closed'
+            trade['ClosePrice'] = round(current_prices[trade['commodity']], 2)
+            trade['RealizedPnL'] = calculate_pnl(trade, current_prices[trade['commodity']], is_close=True)
+            trade['UnrealizedPnL'] = 0.0
+            trade['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
+            producer.produce(TOPIC, json.dumps(trade).encode('utf-8'), callback=delivery_report)
 
-        # === CONSUME & PUSH TO POWER BI ===
-        # Poll for up to 1 second
-        for message in consumer:
-            data = message.value
-            if data['type'] == 'price':
-                current_prices[data['commodity']] = data['price']
-
-            row = {
-                "Timestamp": data.get('timestamp', time.strftime('%Y-%m-%dT%H:%M:%SZ')),
-                "Commodity": data['commodity'],
-                "CurrentPrice": current_prices[data['commodity']],
-                "Volume": data.get('volume', 0),
-                "TradeID": data.get('trade_id', 0),
-                "Quantity": data.get('quantity', 0),
-                "EntryPrice": data.get('entry_price', 0),
-                "Status": data.get('status', ''),
-                "PositionType": data.get('position_type', ''),
-                "ClosePrice": data.get('close_price', 0),
-                "UnrealizedPnL": 0.0,
-                "RealizedPnL": 0.0
-            }
-
-            if data['type'] == 'trade' and 'trade_id' in data:
-                current_price = current_prices[data['commodity']]
-                if data['status'] == 'Open':
-                    row['UnrealizedPnL'] = calculate_pnl(data, current_price)
-                elif data['status'] == 'Closed':
-                    row['RealizedPnL'] = calculate_pnl(data, current_price, is_close=True)
-
-            payload = [row]
-            try:
-                response = requests.post(PUSH_URL, headers=HEADERS, data=json.dumps(payload), timeout=10)
-                if response.status_code != 200:
-                    print(f"Push failed: {response.status_code} - {response.text}")
-            except Exception as e:
-                print(f"Request error: {e}")
-
-        time.sleep(5)  # Control production rate
+        producer.flush()  # Ensure all messages are sent
+        time.sleep(5)
 
 except KeyboardInterrupt:
-    print("\nStopping producer...")
+    print("\nStopping...")
 finally:
-    producer.close()
-    consumer.close()
+    producer.flush()
