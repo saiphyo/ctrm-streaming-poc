@@ -3,17 +3,15 @@ import time
 import random
 import os
 from dotenv import load_dotenv
+from datetime import datetime, timezone
+from confluent_kafka import Producer
 
 load_dotenv()
 
-from confluent_kafka import Producer
-
-# === FABRIC KAFKA ENDPOINT ===
-BOOTSTRAP_SERVERS = os.getenv("FABRIC_KAFKA_BOOTSTRAP")  # e.g., ctrm-rti-poc-eh.servicebus.windows.net:9093
+BOOTSTRAP_SERVERS = os.getenv("FABRIC_KAFKA_BOOTSTRAP")
 CONNECTION_STRING = os.getenv("FABRIC_KAFKA_CONN_STR")
-TOPIC = 'es_9eef4b9d-020e-433b-b139-a3c5e405d505' 
+TOPIC = 'es_22fdb18a-51d8-4cc6-b304-2e16fb0545f1'
 
-# SASL config
 conf = {
     'bootstrap.servers': BOOTSTRAP_SERVERS,
     'security.protocol': 'SASL_SSL',
@@ -25,36 +23,29 @@ conf = {
 
 producer = Producer(conf)
 
-# Delivery callback
 def delivery_report(err, msg):
     if err:
         print(f"Message failed: {err}")
     else:
         print(f"✓ Sent to {msg.topic()} [{msg.partition()}] @ offset {msg.offset()}")
 
-# === STATE ===
 commodities = ['Oil', 'Gold', 'Wheat']
 current_prices = {comm: 100.0 for comm in commodities}
 trade_counter = 0
 open_trades = []
 
 print("=" * 60)
-print("CTRM KAFKA PRODUCER - EVENT-DRIVEN (with EventType)")
+print("CTRM KAFKA PRODUCER - WITH PRICE CHANGE DETECTION")
 print("=" * 60)
-print(f"Bootstrap: {BOOTSTRAP_SERVERS}")
-print(f"Topic: {TOPIC}")
-print("=" * 60)
-print()
 
-# === MAIN LOOP ===
 try:
     while True:
-        # 1. UPDATE PRICES
+        # UPDATE PRICES
         for comm in commodities:
             current_prices[comm] += random.uniform(-2, 2)
-            current_prices[comm] = max(50, min(150, current_prices[comm]))  # Keep in range
+            current_prices[comm] = max(50, min(150, current_prices[comm]))
 
-            # Send PRICE TICK (no trade event)
+            # SEND PRICE TICK WITH LastUpdatedUtc
             payload = {
                 'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'commodity': comm,
@@ -68,18 +59,19 @@ try:
                 'ClosePrice': 0,
                 'UnrealizedPnL': 0,
                 'RealizedPnL': 0,
-                'EventType': 'PriceTick'  # <-- ADD THIS
+                'EventType': 'PriceTick',
+                'LastUpdatedUtc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             }
+            # print(f"DEBUG: {json.dumps(payload, indent=2)}")  # Debug
             producer.produce(TOPIC, json.dumps(payload).encode('utf-8'), callback=delivery_report)
 
-        # 2. OPEN NEW TRADE (30% chance)
+        # OPEN NEW TRADE (30% chance)
         if random.random() > 0.7:
             trade_counter += 1
             comm = random.choice(commodities)
             quantity = round(random.uniform(100, 1000), 2)
             entry_price = round(current_prices[comm], 2)
             position_type = random.choice(['Long', 'Short'])
-            unrealized_pnl = 0
 
             open_trades.append({
                 'TradeID': trade_counter,
@@ -101,14 +93,15 @@ try:
                 'Status': 'Open',
                 'PositionType': position_type,
                 'ClosePrice': 0,
-                'UnrealizedPnL': unrealized_pnl,
+                'UnrealizedPnL': 0,
                 'RealizedPnL': 0.0,
-                'EventType': 'TradeOpened'  # <-- ADD THIS (KEY FOR EVENT-DRIVEN REFRESH)
+                'EventType': 'TradeOpened',
+                'LastUpdatedUtc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             producer.produce(TOPIC, json.dumps(payload).encode('utf-8'), callback=delivery_report)
             print(f"📊 NEW TRADE: {position_type} {quantity} {comm} @ {entry_price}")
 
-        # 3. CLOSE TRADE (20% chance if trades exist)
+        # CLOSE TRADE (20% chance)
         if open_trades and random.random() > 0.8:
             trade_idx = random.randint(0, len(open_trades) - 1)
             open_trade = open_trades.pop(trade_idx)
@@ -120,7 +113,7 @@ try:
 
             if position_type == 'Long':
                 realized_pnl = (close_price - entry_price) * quantity
-            else:  # Short
+            else:
                 realized_pnl = (entry_price - close_price) * quantity
 
             payload = {
@@ -136,14 +129,15 @@ try:
                 'ClosePrice': close_price,
                 'UnrealizedPnL': 0,
                 'RealizedPnL': round(realized_pnl, 2),
-                'EventType': 'TradeClosed'  # <-- ADD THIS (KEY FOR EVENT-DRIVEN REFRESH)
+                'EventType': 'TradeClosed',
+                'LastUpdatedUtc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             producer.produce(TOPIC, json.dumps(payload).encode('utf-8'), callback=delivery_report)
             print(f"✓ TRADE CLOSED: {open_trade['TradeID']} | PnL: {realized_pnl:.2f}")
 
-        # 4. UPDATE UNREALIZED PnL FOR OPEN TRADES (send updated prices)
+        # UPDATE UNREALIZED PnL (50% of open trades)
         for trade in open_trades:
-            if random.random() > 0.5:  # Send updates for ~50% of open trades
+            if random.random() > 0.5:
                 price = current_prices[trade['commodity']]
                 if trade['position_type'] == 'Long':
                     unrealized_pnl = (price - trade['entry_price']) * trade['quantity']
@@ -163,16 +157,16 @@ try:
                     'ClosePrice': 0,
                     'UnrealizedPnL': round(unrealized_pnl, 2),
                     'RealizedPnL': 0.0,
-                    'EventType': 'PriceTick'  # Regular update, no event
+                    'EventType': 'PriceTick',
+                    'LastUpdatedUtc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                 }
                 producer.produce(TOPIC, json.dumps(payload).encode('utf-8'), callback=delivery_report)
 
-        # 5. WAIT 5 SECONDS
         time.sleep(5)
         print()
 
 except KeyboardInterrupt:
-    print("\n⚠ Producer stopped by user")
+    print("\n⚠ Producer stopped")
 finally:
     producer.flush()
-    print("✓ All messages flushed")
+    print("✓ Flushed")
