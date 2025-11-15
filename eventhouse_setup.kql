@@ -1,0 +1,73 @@
+// =====================================================
+// EVENTHOUSE SETUP SCRIPT FOR CTRM PRODUCER-V2.PY
+// =====================================================
+
+// 1. CREATE TABLE (if using new database)
+.create table CTRMTrades (
+    timestamp: datetime,
+    commodity: string,
+    CurrentPrice: real,
+    Volume: real,
+    TradeID: long,
+    Quantity: real,
+    EntryPrice: real,
+    Status: string,
+    PositionType: string,
+    ClosePrice: real,
+    UnrealizedPnL: real,
+    RealizedPnL: real,
+    EventType: string,
+    LastUpdatedUtc: datetime
+)
+
+// 2. CREATE JSON MAPPING
+.create table CTRMTrades ingestion json mapping 'CTRMTrades_JSON_Mapping' 
+'['
+'{"column":"timestamp","path":"$.timestamp","datatype":"datetime"},'
+'{"column":"commodity","path":"$.commodity","datatype":"string"},'
+'{"column":"CurrentPrice","path":"$.CurrentPrice","datatype":"real"},'
+'{"column":"Volume","path":"$.Volume","datatype":"real"},'
+'{"column":"TradeID","path":"$.TradeID","datatype":"long"},'
+'{"column":"Quantity","path":"$.Quantity","datatype":"real"},'
+'{"column":"EntryPrice","path":"$.EntryPrice","datatype":"real"},'
+'{"column":"Status","path":"$.Status","datatype":"string"},'
+'{"column":"PositionType","path":"$.PositionType","datatype":"string"},'
+'{"column":"ClosePrice","path":"$.ClosePrice","datatype":"real"},'
+'{"column":"UnrealizedPnL","path":"$.UnrealizedPnL","datatype":"real"},'
+'{"column":"RealizedPnL","path":"$.RealizedPnL","datatype":"real"},'
+'{"column":"EventType","path":"$.EventType","datatype":"string"},'
+'{"column":"LastUpdatedUtc","path":"$.LastUpdatedUtc","datatype":"datetime"}'
+']'
+
+// 3. ENABLE STREAMING INGESTION (OPTIONAL - for lower latency)
+.alter table CTRMTrades policy streamingingestion enable
+
+// 4. SET INGESTION BATCHING POLICY (OPTIONAL - adjust for your needs)
+.alter table CTRMTrades policy ingestionbatching 
+```
+{
+  "MaximumBatchingTimeSpan": "00:00:30",
+  "MaximumNumberOfItems": 500,
+  "MaximumRawDataSizeMB": 1024
+}
+```
+
+// 5. VERIFY TABLE SCHEMA
+.show table CTRMTrades schema
+
+// 6. TEST QUERY (after ingestion starts)
+CTRMTrades
+| take 10
+
+// 7. COUNT RECORDS
+CTRMTrades
+| count
+
+// 8. VIEW BY EVENT TYPE
+CTRMTrades
+| summarize Count=count() by EventType
+
+// 9. MONITOR INGESTION FAILURES (if any)
+.show ingestion failures
+| where Table == "CTRMTrades"
+| where FailedOn > ago(1h)

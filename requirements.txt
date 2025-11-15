@@ -1,1 +1,8 @@
-﻿confluent-kafka>=2.3.0
+﻿# Original dependencies (producer-v1.py)
+confluent-kafka>=2.3.0
+python-dotenv==1.0.0
+
+# New dependencies for producer-v2.py
+azure-kusto-data==4.3.1
+azure-kusto-ingest==4.3.1
+azure-identity==1.15.0
